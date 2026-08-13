@@ -1,0 +1,1 @@
+polished launcher icon, lowercase store listings, gradle wrapper, and faster save flow.

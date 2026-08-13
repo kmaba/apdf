@@ -1,0 +1,32 @@
+Categories:
+  - Office
+License: GPL-3.0-only
+AuthorName: kmaba
+SourceCode: https://github.com/kmaba/apdf
+IssueTracker: https://github.com/kmaba/apdf/issues
+Changelog: https://github.com/kmaba/apdf/releases
+WebSite: https://github.com/kmaba/apdf
+
+AutoName: apdf
+
+Description: |
+  convert word, powerpoint, images, text and pdf files into a single pdf,
+  entirely on your device. no network, no accounts, no tracking. merge any
+  mix of files in the order you choose, keep output under 8 mb, and save
+  wherever you pick. share from any app or add files directly.
+
+RepoType: git
+Repo: https://github.com/kmaba/apdf.git
+
+Builds:
+  - versionName: '1.0.1'
+    versionCode: 2
+    commit: REPLACE_WITH_COMMIT
+    subdir: app
+    gradle:
+      - yes
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: '1.0.1'
+CurrentVersionCode: 2

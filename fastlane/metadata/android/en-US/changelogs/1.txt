@@ -1,0 +1,1 @@
+first release. convert and merge word, powerpoint, images, text and pdf into a single pdf, fully offline. output is automatically capped at 8 mb and saved wherever you choose.
