@@ -4,17 +4,23 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M33.6,22 H64.4 L74.4,32 V86 H33.6 Z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M64.4,22 L74.4,32 L64.4,32 Z" />
-    <path
-        android:strokeColor="#000000"
-        android:strokeWidth="5.8"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:fillColor="@android:color/transparent"
-        android:pathData="M54,41.3 L54,69 M48.2,63.6 L54,69.8 L59.8,63.6 M46.1,49.8 L61.9,49.8" />
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="0.8"
+        android:scaleY="0.8">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M33.6,22 H64.4 L74.4,32 V86 H33.6 Z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M64.4,22 L74.4,32 L64.4,32 Z" />
+        <path
+            android:strokeColor="#000000"
+            android:strokeWidth="5.8"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:fillColor="@android:color/transparent"
+            android:pathData="M54,41.3 L54,69 M48.2,63.6 L54,69.8 L59.8,63.6 M46.1,49.8 L61.9,49.8" />
+    </group>
 </vector>
