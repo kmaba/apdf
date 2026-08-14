@@ -23,8 +23,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.View.MeasureSpec
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ArrayAdapter
@@ -49,7 +47,6 @@ import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
-import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
@@ -66,7 +63,12 @@ class MainActivity : AppCompatActivity() {
     private val picks = ArrayList<Picked>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var converting = false
+    private val native = NativeConverters { resources.openRawResource(R.font.space_grotesk) }
 
+    // High-fidelity rendering via a single reused WebView (created on the main
+    // thread, never destroyed/recreated between conversions). Falls back to the
+    // native converter if the WebView path is unavailable.
+    private var webView: WebView? = null
     @Volatile private var doneLatch = CountDownLatch(1)
     @Volatile private var jsError: String? = null
     @Volatile private var pendingB64: String? = null
@@ -86,6 +88,9 @@ class MainActivity : AppCompatActivity() {
         btnAdd = findViewById(R.id.btnAdd)
         btnClear = findViewById(R.id.btnClear)
         btnMode = findViewById(R.id.btnMode)
+
+        // pdfbox-android loads cmap/glyphlist resources from app assets; must init once.
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(applicationContext)
 
         adapter = object : ArrayAdapter<Picked>(
             this, android.R.layout.simple_list_item_2, android.R.id.text1, picks
@@ -140,48 +145,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateModeButton() {
         btnMode.text = if (separateMode) getString(R.string.mode_separate) else getString(R.string.mode_combined)
-    }
-
-    private fun createWorkerWebView(): WebView {
-        val wv = WebView(this)
-        val s = wv.settings
-        s.javaScriptEnabled = true
-        s.domStorageEnabled = true
-        s.blockNetworkLoads = true
-        s.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        s.loadWithOverviewMode = false
-        s.useWideViewPort = false
-        s.textZoom = 100
-        wv.setBackgroundColor(0xFFFFFFFF.toInt())
-        wv.addJavascriptInterface(object {
-            @JavascriptInterface
-            fun done() {
-                doneLatch.countDown()
-            }
-
-            @JavascriptInterface
-            fun getB64(): String = pendingB64 ?: ""
-
-            @JavascriptInterface
-            fun reportError(msg: String) {
-                jsError = msg
-            }
-        }, "converterBridge")
-        val root = findViewById<FrameLayout>(R.id.root)
-        val lp = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
-        wv.layoutParams = lp
-        wv.translationX = -20000f
-        wv.translationY = -20000f
-        root.addView(wv, lp)
-        return wv
-    }
-
-    private fun destroyWorkerWebView(wv: WebView) {
-        try {
-            (wv.parent as? ViewGroup)?.removeView(wv)
-            wv.destroy()
-        } catch (_: Exception) {
-        }
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -479,17 +442,74 @@ class MainActivity : AppCompatActivity() {
     private fun convertOne(file: File, ext: String): File {
         return when (ext) {
             "pdf" -> file
-            "docx" -> runJsConversion(docxWorkerHtml(), file, "docx", 60_000)
+            "docx" -> convertWithWebView(docxWorkerHtml(), file, "docx", 60_000) {
+                native.docxToPdf(file, uniquePdf("docx"))
+            }
             "doc" -> throw IOException("'$ext' is the old Word format. Re-save the document as .docx and try again.")
-            "pptx" -> runJsConversion(pptxWorkerHtml(), file, "pptx", 90_000)
+            "pptx" -> convertWithWebView(pptxWorkerHtml(), file, "pptx", 90_000) {
+                native.pptxToPdf(file, uniquePdf("pptx"))
+            }
             "ppt" -> throw IOException("'$ext' is the old PowerPoint format. Re-save the presentation as .pptx and try again.")
             "png", "jpg", "jpeg", "webp", "bmp", "gif" -> imageToPdf(file, ext)
-            "txt", "md", "markdown", "html", "htm" -> runJsConversion(textWorkerHtml(file, ext), file, "text", 30_000)
+            "txt", "md", "markdown" -> convertWithWebView(textWorkerHtml(file, ext), file, "text", 30_000) {
+                native.textToPdf(file, uniquePdf("text"))
+            }
+            "html", "htm" -> convertWithWebView(htmlWorkerHtml(file), file, "html", 30_000) {
+                native.htmlToPdf(file, uniquePdf("html"))
+            }
             else -> throw IOException("Unsupported file type '.$ext'.")
         }
     }
 
-    // ---------- WebView / JS conversion ----------
+    // ---------- WebView (high fidelity) ----------
+
+    private fun convertWithWebView(html: String, file: File, label: String, timeoutMs: Long, fallback: () -> File): File {
+        return try {
+            runJsConversion(html, file, label, timeoutMs)
+        } catch (t: Throwable) {
+            try {
+                fallback()
+            } catch (_: Throwable) {
+                throw t
+            }
+        }
+    }
+
+    private fun ensureWebView(): WebView = onMain {
+        webView ?: WebView(this).apply {
+            val s = settings
+            s.javaScriptEnabled = true
+            s.domStorageEnabled = true
+            s.blockNetworkLoads = true
+            s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            s.loadWithOverviewMode = false
+            s.useWideViewPort = false
+            s.textZoom = 100
+            setBackgroundColor(0xFFFFFFFF.toInt())
+            addJavascriptInterface(object {
+                @JavascriptInterface
+                fun done() {
+                    doneLatch.countDown()
+                }
+
+                @JavascriptInterface
+                fun getB64(): String = pendingB64 ?: ""
+
+                @JavascriptInterface
+                fun reportError(msg: String) {
+                    jsError = msg
+                }
+            }, "converterBridge")
+            val root = findViewById<FrameLayout>(R.id.root)
+            val lp = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
+            layoutParams = lp
+            translationX = -20000f
+            translationY = -20000f
+            root.addView(this, lp)
+            webView = this
+        }
+        webView!!
+    }
 
     private fun runJsConversion(workerHtml: String, file: File, label: String, timeoutMs: Long): File {
         val bytes = file.readBytes()
@@ -497,47 +517,31 @@ class MainActivity : AppCompatActivity() {
             throw IOException("$label is too large for on-device rendering (max ~45 MB).")
         }
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-        val wv = onMain { createWorkerWebView() }
-        val alive = java.util.concurrent.atomic.AtomicBoolean(true)
-        var runConvert: Runnable? = null
-        try {
-            doneLatch = CountDownLatch(1)
-            jsError = null
-            pendingB64 = b64
-            var started = false
-            runConvert = Runnable {
-                if (alive.get() && !started) {
-                    started = true
-                    wv.evaluateJavascript("window.start()", null)
+        val wv = ensureWebView()
+        doneLatch = CountDownLatch(1)
+        jsError = null
+        pendingB64 = b64
+        onMain {
+            wv.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.evaluateJavascript("window.start()", null)
                 }
             }
-            mainHandler.post {
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        if (alive.get()) runConvert?.let { view?.post(it) }
-                    }
-
-                    @Suppress("OVERRIDE_DEPRECATION")
-                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
-                }
-                wv.loadDataWithBaseURL(null, workerHtml, "text/html", "utf-8", null)
-            }
-            mainHandler.postDelayed(runConvert, 15_000)
-
-            if (!doneLatch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-                throw IOException("Rendering '$label' timed out.")
-            }
-            jsError?.let { throw IOException("$label conversion error: $it") }
-
-            Thread.sleep(700)
-            onMain { layoutForPrint(wv) }
-            return printWebViewToPdf(wv, uniquePdf(label))
-        } finally {
-            pendingB64 = null
-            alive.set(false)
-            runConvert?.let { mainHandler.removeCallbacks(it) }
-            mainHandler.postDelayed({ destroyWorkerWebView(wv) }, 300)
+            wv.loadDataWithBaseURL(null, workerHtml, "text/html", "utf-8", null)
         }
+
+        if (!doneLatch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            throw IOException("Rendering '$label' timed out.")
+        }
+        jsError?.let { throw IOException("$label conversion error: $it") }
+
+        Thread.sleep(700)
+        onMain { layoutForPrint(wv) }
+        val out = printWebViewToPdf(wv, uniquePdf(label))
+        // Reset for the next conversion; the WebView itself is reused, never destroyed.
+        pendingB64 = null
+        onMain { wv.loadUrl("about:blank") }
+        return out
     }
 
     private fun layoutForPrint(wv: WebView) {
@@ -555,55 +559,9 @@ class MainActivity : AppCompatActivity() {
         if (outFile.exists()) outFile.delete()
         val adapter = onMain { wv.createPrintDocumentAdapter("document") }
         val ok = PdfPrint().print(adapter, outFile)
-        return if (ok) outFile else {
-            if (outFile.exists()) outFile.delete()
-            onMain { rasterizeWebViewToPdf(wv, outFile) }
-        }
-    }
-
-    private fun rasterizeWebViewToPdf(wv: WebView, outFile: File): File {
-        val pageW = 794
-        val pageH = 1123
-        val scale = 2.0f
-        val bmpW = (pageW * scale).toInt()
-        val bmpH = (pageH * scale).toInt()
-        val totalH = max(wv.measuredHeight, pageH)
-        val numPages = (totalH + pageH - 1) / pageH
-        val pagePts = PDRectangle(595.28f, 841.89f)
-        val doc = PDDocument()
-        try {
-            for (i in 0 until numPages) {
-                val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(bmp)
-                canvas.scale(scale, scale)
-                canvas.translate(0f, -(i * pageH).toFloat())
-                canvas.drawColor(android.graphics.Color.WHITE)
-                wv.draw(canvas)
-                val bos = java.io.ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
-                bmp.recycle()
-                val page = PDPage(pagePts)
-                doc.addPage(page)
-                val img = PDImageXObject.createFromByteArray(doc, bos.toByteArray(), "p$i.jpg")
-                val cs = PDPageContentStream(doc, page)
-                cs.drawImage(img, 0f, 0f, 595.28f, 841.89f)
-                cs.close()
-            }
-            doc.save(outFile)
-            return outFile
-        } finally {
-            try {
-                doc.close()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun closeQuietly(pfd: ParcelFileDescriptor?) {
-        try {
-            pfd?.close()
-        } catch (_: Exception) {
-        }
+        if (ok) return outFile
+        if (outFile.exists()) outFile.delete()
+        throw IOException("Could not render the document to PDF.")
     }
 
     private fun <T> onMain(block: () -> T): T {
@@ -743,16 +701,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun textWorkerHtml(file: File, ext: String): String {
         val raw = file.readText(Charsets.UTF_8)
-        val bodyHtml = when (ext) {
-            "html", "htm" -> raw
-            else -> raw
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                .let { "<pre style=\"white-space:pre-wrap;font-family:Consolas,monospace;font-size:11pt\">$it</pre>" }
-        }
+        val bodyHtml = raw
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .let { "<pre style=\"white-space:pre-wrap;font-family:Consolas,monospace;font-size:11pt\">$it</pre>" }
         return """
             <!DOCTYPE html><html><head><meta charset="utf-8">
             <style>@page { size: A4; margin: 14mm; } html,body{margin:0;padding:0}</style>
             </head><body>$bodyHtml
+            <script>window.start = function () { try { converterBridge.done(); } catch (e) {} };</script>
+            </body></html>
+        """.trimIndent()
+    }
+
+    private fun htmlWorkerHtml(file: File): String {
+        val raw = file.readText(Charsets.UTF_8)
+        return """
+            <!DOCTYPE html><html><head><meta charset="utf-8">
+            <style>@page { size: A4; margin: 14mm; }</style>
+            </head><body>$raw
             <script>window.start = function () { try { converterBridge.done(); } catch (e) {} };</script>
             </body></html>
         """.trimIndent()

@@ -11,8 +11,8 @@ android {
         applicationId = "link.kmaba.apdf"
         minSdk = 21
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.1.2"
+        versionCode = 6
+        versionName = "1.2.0"
     }
 
     signingConfigs {
@@ -46,6 +46,13 @@ android {
             excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE", "META-INF/LICENSE.txt", "META-INF/NOTICE", "META-INF/NOTICE.txt")
         }
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+        unitTests.all {
+            it.systemProperty("test.font.path", project.file("src/main/res/font/space_grotesk.ttf").absolutePath)
+        }
+    }
 }
 
 dependencies {
@@ -53,4 +60,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
 }
