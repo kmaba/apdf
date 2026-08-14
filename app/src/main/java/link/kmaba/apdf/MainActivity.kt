@@ -494,7 +494,7 @@ class MainActivity : AppCompatActivity() {
             throw IOException("$label is too large for on-device rendering (max ~45 MB).")
         }
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-        val wv = createWorkerWebView()
+        val wv = onMain { createWorkerWebView() }
         try {
             doneLatch = CountDownLatch(1)
             jsError = null
