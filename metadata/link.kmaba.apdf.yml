@@ -56,8 +56,14 @@ Builds:
     subdir: app
     gradle:
       - yes
+  - versionName: '1.3.0'
+    versionCode: 8
+    commit: ba8f4b28a3a07015da1d7aead7b84d318ac8d4a9
+    subdir: app
+    gradle:
+      - yes
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
-CurrentVersion: '1.2.1'
-CurrentVersionCode: 7
+CurrentVersion: '1.3.0'
+CurrentVersionCode: 8
