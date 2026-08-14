@@ -346,6 +346,7 @@ class MainActivity : AppCompatActivity() {
         val snapshot = ArrayList(picks)
         Thread {
             try {
+                if (isFinishing || isDestroyed) return@Thread
                 if (separateMode) {
                     val results = ArrayList<Pair<File, String>>()
                     snapshot.forEachIndexed { idx, pick ->
@@ -355,6 +356,7 @@ class MainActivity : AppCompatActivity() {
                         results.add(finalPdf to singleName(pick, idx))
                     }
                     mainHandler.post {
+                        if (isFinishing || isDestroyed) return@post
                         progress.dismiss()
                         launchSaveToDirectory(results)
                     }
@@ -368,6 +370,7 @@ class MainActivity : AppCompatActivity() {
                     val finalFile = ensureUnder8mb(merged)
                     val outName = outputName(snapshot)
                     mainHandler.post {
+                        if (isFinishing || isDestroyed) return@post
                         progress.dismiss()
                         launchSaveAs(finalFile, outName)
                     }
@@ -376,6 +379,7 @@ class MainActivity : AppCompatActivity() {
                 val trace = t.stackTrace.take(8).joinToString("\n") { "  at $it" }
                 val msg = "${t.javaClass.simpleName}: ${t.message}\n\n$trace"
                 mainHandler.post {
+                    if (isFinishing || isDestroyed) return@post
                     progress.dismiss()
                     AlertDialog.Builder(this)
                         .setTitle("Conversion failed")
@@ -385,7 +389,7 @@ class MainActivity : AppCompatActivity() {
                 }
             } finally {
                 converting = false
-                mainHandler.post { refreshList() }
+                mainHandler.post { if (!isFinishing && !isDestroyed) refreshList() }
             }
         }.start()
 
@@ -464,13 +468,15 @@ class MainActivity : AppCompatActivity() {
     // ---------- WebView (high fidelity) ----------
 
     private fun convertWithWebView(html: String, file: File, label: String, timeoutMs: Long, fallback: () -> File): File {
-        return try {
-            runJsConversion(html, file, label, timeoutMs)
+        try {
+            return runJsConversion(html, file, label, timeoutMs)
         } catch (t: Throwable) {
-            try {
+            return try {
                 fallback()
-            } catch (_: Throwable) {
-                throw t
+            } catch (f: Throwable) {
+                throw IOException(
+                    "WebView conversion failed ($label): ${t.message}\nNative fallback failed: ${f.message}"
+                )
             }
         }
     }
@@ -500,12 +506,20 @@ class MainActivity : AppCompatActivity() {
                     jsError = msg
                 }
             }, "converterBridge")
-            val root = findViewById<FrameLayout>(R.id.root)
-            val lp = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
-            layoutParams = lp
-            translationX = -20000f
-            translationY = -20000f
-            root.addView(this, lp)
+            // Host the WebView off-screen so it has a window context for
+            // rendering. If the activity's view tree isn't available (e.g. the
+            // activity is being destroyed/recreated mid-conversion), keep going
+            // anyway: the view is measured manually before printing, which does
+            // not require attachment.
+            try {
+                val host: ViewGroup = findViewById(android.R.id.content)
+                    ?: window.decorView as ViewGroup
+                layoutParams = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
+                translationX = -20000f
+                translationY = -20000f
+                host.addView(this)
+            } catch (_: Throwable) {
+            }
             webView = this
         }
         webView!!
@@ -540,7 +554,10 @@ class MainActivity : AppCompatActivity() {
         val out = printWebViewToPdf(wv, uniquePdf(label))
         // Reset for the next conversion; the WebView itself is reused, never destroyed.
         pendingB64 = null
-        onMain { wv.loadUrl("about:blank") }
+        try {
+            onMain { wv.loadUrl("about:blank") }
+        } catch (_: Throwable) {
+        }
         return out
     }
 
