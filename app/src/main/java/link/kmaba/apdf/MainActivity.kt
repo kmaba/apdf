@@ -7,15 +7,12 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Matrix
-import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.ParcelFileDescriptor
 import android.print.PdfPrint
 import android.provider.MediaStore
 import android.util.Base64
@@ -62,12 +59,11 @@ class MainActivity : AppCompatActivity() {
 
     private val picks = ArrayList<Picked>()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var converting = false
-    private val native = NativeConverters { resources.openRawResource(R.font.space_grotesk) }
+    @Volatile private var converting = false
 
-    // High-fidelity rendering via a single reused WebView (created on the main
-    // thread, never destroyed/recreated between conversions). Falls back to the
-    // native converter if the WebView path is unavailable.
+    // High-fidelity rendering via a single reused WebView, created once in
+    // onCreate on the main thread and attached off-screen. Reused for every
+    // conversion and never destroyed/recreated between conversions.
     private var webView: WebView? = null
     @Volatile private var doneLatch = CountDownLatch(1)
     @Volatile private var jsError: String? = null
@@ -91,6 +87,15 @@ class MainActivity : AppCompatActivity() {
 
         // pdfbox-android loads cmap/glyphlist resources from app assets; must init once.
         com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(applicationContext)
+
+        // Create the rendering WebView up front, on the main thread, while the
+        // view hierarchy is fully built. This guarantees the host container is
+        // never null during a conversion, eliminating the null view-tree crash.
+        webView = try {
+            createWebView()
+        } catch (t: Throwable) {
+            null
+        }
 
         adapter = object : ArrayAdapter<Picked>(
             this, android.R.layout.simple_list_item_2, android.R.id.text1, picks
@@ -141,6 +146,17 @@ class MainActivity : AppCompatActivity() {
         setIntent(intent)
         handleIntent(intent)
         refreshList()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Only tear the WebView down when no conversion is running; the
+        // background conversion thread may still be rendering mid-print.
+        if (!converting) {
+            val wv = webView
+            webView = null
+            wv?.destroy()
+        }
     }
 
     private fun updateModeButton() {
@@ -352,8 +368,7 @@ class MainActivity : AppCompatActivity() {
                     snapshot.forEachIndexed { idx, pick ->
                         val src = copyToCache(pick, idx)
                         val pdf = convertOne(src, pick.ext)
-                        val finalPdf = ensureUnder8mb(pdf)
-                        results.add(finalPdf to singleName(pick, idx))
+                        results.add(pdf to singleName(pick, idx))
                     }
                     mainHandler.post {
                         if (isFinishing || isDestroyed) return@post
@@ -367,12 +382,11 @@ class MainActivity : AppCompatActivity() {
                         pdfs.add(convertOne(src, pick.ext))
                     }
                     val merged = if (pdfs.size == 1) pdfs[0] else mergePdfs(pdfs)
-                    val finalFile = ensureUnder8mb(merged)
                     val outName = outputName(snapshot)
                     mainHandler.post {
                         if (isFinishing || isDestroyed) return@post
                         progress.dismiss()
-                        launchSaveAs(finalFile, outName)
+                        launchSaveAs(merged, outName)
                     }
                 }
             } catch (t: Throwable) {
@@ -446,83 +460,63 @@ class MainActivity : AppCompatActivity() {
     private fun convertOne(file: File, ext: String): File {
         return when (ext) {
             "pdf" -> file
-            "docx" -> convertWithWebView(docxWorkerHtml(), file, "docx", 60_000) {
-                native.docxToPdf(file, uniquePdf("docx"))
-            }
+            "docx" -> runJsConversion(docxWorkerHtml(), file, "docx", 60_000)
             "doc" -> throw IOException("'$ext' is the old Word format. Re-save the document as .docx and try again.")
-            "pptx" -> convertWithWebView(pptxWorkerHtml(), file, "pptx", 90_000) {
-                native.pptxToPdf(file, uniquePdf("pptx"))
-            }
+            "pptx" -> runJsConversion(pptxWorkerHtml(), file, "pptx", 90_000)
             "ppt" -> throw IOException("'$ext' is the old PowerPoint format. Re-save the presentation as .pptx and try again.")
             "png", "jpg", "jpeg", "webp", "bmp", "gif" -> imageToPdf(file, ext)
-            "txt", "md", "markdown" -> convertWithWebView(textWorkerHtml(file, ext), file, "text", 30_000) {
-                native.textToPdf(file, uniquePdf("text"))
-            }
-            "html", "htm" -> convertWithWebView(htmlWorkerHtml(file), file, "html", 30_000) {
-                native.htmlToPdf(file, uniquePdf("html"))
-            }
+            "txt", "md", "markdown" -> runJsConversion(textWorkerHtml(file, ext), file, "text", 30_000)
+            "html", "htm" -> runJsConversion(htmlWorkerHtml(file), file, "html", 30_000)
             else -> throw IOException("Unsupported file type '.$ext'.")
         }
     }
 
     // ---------- WebView (high fidelity) ----------
 
-    private fun convertWithWebView(html: String, file: File, label: String, timeoutMs: Long, fallback: () -> File): File {
-        try {
-            return runJsConversion(html, file, label, timeoutMs)
-        } catch (t: Throwable) {
-            return try {
-                fallback()
-            } catch (f: Throwable) {
-                throw IOException(
-                    "WebView conversion failed ($label): ${t.message}\nNative fallback failed: ${f.message}"
-                )
+    private fun createWebView(): WebView {
+        val wv = WebView(this)
+        val s = wv.settings
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = true
+        s.blockNetworkLoads = true
+        s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        s.loadWithOverviewMode = false
+        s.useWideViewPort = false
+        s.textZoom = 100
+        wv.setBackgroundColor(0xFFFFFFFF.toInt())
+        wv.addJavascriptInterface(object {
+            @JavascriptInterface
+            fun done() {
+                doneLatch.countDown()
             }
-        }
+
+            @JavascriptInterface
+            fun getB64(): String = pendingB64 ?: ""
+
+            @JavascriptInterface
+            fun reportError(msg: String) {
+                jsError = msg
+            }
+        }, "converterBridge")
+        // Host the WebView off-screen so it has a window context for rendering.
+        // The root FrameLayout from our own layout always exists once
+        // setContentView has run, so the host can never be null here.
+        val host: ViewGroup = findViewById(R.id.root)
+            ?: (window.decorView as ViewGroup)
+        val lp = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
+        wv.layoutParams = lp
+        wv.translationX = -20000f
+        wv.translationY = -20000f
+        host.addView(wv, lp)
+        return wv
     }
 
-    private fun ensureWebView(): WebView = onMain {
-        webView ?: WebView(this).apply {
-            val s = settings
-            s.javaScriptEnabled = true
-            s.domStorageEnabled = true
-            s.blockNetworkLoads = true
-            s.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            s.loadWithOverviewMode = false
-            s.useWideViewPort = false
-            s.textZoom = 100
-            setBackgroundColor(0xFFFFFFFF.toInt())
-            addJavascriptInterface(object {
-                @JavascriptInterface
-                fun done() {
-                    doneLatch.countDown()
-                }
-
-                @JavascriptInterface
-                fun getB64(): String = pendingB64 ?: ""
-
-                @JavascriptInterface
-                fun reportError(msg: String) {
-                    jsError = msg
-                }
-            }, "converterBridge")
-            // Host the WebView off-screen so it has a window context for
-            // rendering. If the activity's view tree isn't available (e.g. the
-            // activity is being destroyed/recreated mid-conversion), keep going
-            // anyway: the view is measured manually before printing, which does
-            // not require attachment.
-            try {
-                val host: ViewGroup = findViewById(android.R.id.content)
-                    ?: window.decorView as ViewGroup
-                layoutParams = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
-                translationX = -20000f
-                translationY = -20000f
-                host.addView(this)
-            } catch (_: Throwable) {
-            }
-            webView = this
+    private fun ensureWebView(): WebView = webView ?: onMain {
+        try {
+            createWebView().also { webView = it }
+        } catch (t: Throwable) {
+            throw IOException("WebView is unavailable on this device.", t)
         }
-        webView!!
     }
 
     private fun runJsConversion(workerHtml: String, file: File, label: String, timeoutMs: Long): File {
@@ -759,7 +753,7 @@ class MainActivity : AppCompatActivity() {
         val doc = PDDocument()
         try {
             val bos = java.io.ByteArrayOutputStream()
-            rotated.third.compress(Bitmap.CompressFormat.JPEG, 92, bos)
+            rotated.third.compress(Bitmap.CompressFormat.JPEG, 100, bos)
             val img = PDImageXObject.createFromByteArray(doc, bos.toByteArray(), "img.jpg")
             val page = PDPage(PDRectangle(pageW, pageH))
             doc.addPage(page)
@@ -801,7 +795,7 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 
-    // ---------- PDF merge / compress ----------
+    // ---------- PDF merge ----------
 
     private fun mergePdfs(files: List<File>): File {
         val out = uniquePdf("merged")
@@ -810,72 +804,6 @@ class MainActivity : AppCompatActivity() {
         merger.setDestinationFileName(out.absolutePath)
         merger.mergeDocuments(MemoryUsageSetting.setupTempFileOnly())
         return out
-    }
-
-    private fun compressPdf(input: File, dpi: Int, quality: Int): File {
-        val pfd = ParcelFileDescriptor.open(input, ParcelFileDescriptor.MODE_READ_ONLY)
-        val renderer = PdfRenderer(pfd)
-        val doc = PDDocument()
-        try {
-            val scale = dpi / 72f
-            for (i in 0 until renderer.pageCount) {
-                val page = renderer.openPage(i)
-                val pw = page.width.toFloat()
-                val ph = page.height.toFloat()
-                val bw = max(1, (pw * scale).toInt())
-                val bh = max(1, (ph * scale).toInt())
-                val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
-                val m = Matrix()
-                m.postScale(scale, scale)
-                page.render(bmp, null, m, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
-                page.close()
-                val bos = java.io.ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, quality, bos)
-                bmp.recycle()
-                val pdPage = PDPage(PDRectangle(pw, ph))
-                doc.addPage(pdPage)
-                val img = PDImageXObject.createFromByteArray(doc, bos.toByteArray(), "p$i.jpg")
-                val cs = PDPageContentStream(doc, pdPage)
-                cs.drawImage(img, 0f, 0f, pw, ph)
-                cs.close()
-            }
-            val out = uniquePdf("compressed")
-            doc.save(out)
-            return out
-        } finally {
-            try {
-                renderer.close()
-            } catch (_: Exception) {
-            }
-            try {
-                pfd.close()
-            } catch (_: Exception) {
-            }
-            try {
-                doc.close()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun ensureUnder8mb(input: File): File {
-        val limit = 8L * 1024 * 1024
-        if (input.length() <= limit) return input
-        var best = input
-        var bestLen = input.length()
-        for ((dpi, q) in arrayOf(200 to 80, 150 to 75, 120 to 70, 100 to 62, 85 to 52)) {
-            val f = compressPdf(input, dpi, q)
-            if (f.length() < bestLen) {
-                if (best !== input) best.delete()
-                best = f
-                bestLen = f.length()
-            } else {
-                f.delete()
-            }
-            if (bestLen <= limit) break
-        }
-        if (best !== input) input.delete()
-        return best
     }
 
     // ---------- Saving & sharing ----------

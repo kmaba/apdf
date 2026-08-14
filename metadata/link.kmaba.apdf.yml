@@ -12,8 +12,9 @@ AutoName: apdf
 Description: |
   convert word, powerpoint, images, text and pdf files into a single pdf,
   entirely on your device. no network, no accounts, no tracking. merge any
-  mix of files in the order you choose, keep output under 8 mb, and save
-  wherever you pick. share from any app or add files directly.
+  mix of files in the order you choose, keep full original quality with no
+  re-encoding, and save wherever you pick. share from any app or add files
+  directly.
 
 RepoType: git
 Repo: https://github.com/kmaba/apdf.git
