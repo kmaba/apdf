@@ -177,8 +177,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun destroyWorkerWebView(wv: WebView) {
-        (wv.parent as? ViewGroup)?.removeView(wv)
-        wv.destroy()
+        try {
+            (wv.parent as? ViewGroup)?.removeView(wv)
+            wv.destroy()
+        } catch (_: Exception) {
+        }
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -495,13 +498,15 @@ class MainActivity : AppCompatActivity() {
         }
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
         val wv = onMain { createWorkerWebView() }
+        val alive = java.util.concurrent.atomic.AtomicBoolean(true)
+        var runConvert: Runnable? = null
         try {
             doneLatch = CountDownLatch(1)
             jsError = null
             pendingB64 = b64
             var started = false
-            val runConvert = Runnable {
-                if (!started) {
+            runConvert = Runnable {
+                if (alive.get() && !started) {
                     started = true
                     wv.evaluateJavascript("window.start()", null)
                 }
@@ -509,7 +514,7 @@ class MainActivity : AppCompatActivity() {
             mainHandler.post {
                 wv.webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        view?.post(runConvert)
+                        if (alive.get()) runConvert?.let { view?.post(it) }
                     }
 
                     @Suppress("OVERRIDE_DEPRECATION")
@@ -529,7 +534,9 @@ class MainActivity : AppCompatActivity() {
             return printWebViewToPdf(wv, uniquePdf(label))
         } finally {
             pendingB64 = null
-            mainHandler.post { destroyWorkerWebView(wv) }
+            alive.set(false)
+            runConvert?.let { mainHandler.removeCallbacks(it) }
+            mainHandler.postDelayed({ destroyWorkerWebView(wv) }, 300)
         }
     }
 
