@@ -26,6 +26,9 @@ echo ">> building release APK (${VERSION})"
 echo ">> packaging ${DIST}"
 cp -f "${APK}" "${DIST}"
 
+echo ">> pushing commits"
+git push origin HEAD
+
 echo ">> tagging ${TAG}"
 git tag -f "${TAG}"
 
@@ -33,9 +36,10 @@ echo ">> pushing ${TAG}"
 git push origin "${TAG}"
 
 echo ">> publishing GitHub release"
+REPO="$(git remote get-url origin | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')"
 gh release create "${TAG}" "${DIST}" \
   --title "apdf ${VERSION}" \
   --notes "apdf ${VERSION} beta build for testing." \
-  --repo "$(git remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/]+)(\.git)?#\1#')"
+  --repo "${REPO}"
 
-echo ">> done: https://github.com/$(git remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/]+)(\.git)?#\1#')/releases/tag/${TAG}"
+echo ">> done: https://github.com/${REPO}/releases/tag/${TAG}"
