@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">apdf</string>
+    <string name="app_name">APDF</string>
+    <string name="app_subtitle">socio\'s pdf converter</string>
     <string name="share_label">Convert to PDF</string>
     <string name="add_files">Add</string>
     <string name="clear">Clear</string>
     <string name="convert">Convert</string>
+    <string name="mode_combined">Mode: One combined PDF</string>
+    <string name="mode_separate">Mode: Separate PDFs</string>
 </resources>

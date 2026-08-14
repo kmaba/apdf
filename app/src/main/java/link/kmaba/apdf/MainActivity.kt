@@ -59,18 +59,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnConvert: Button
     private lateinit var btnAdd: Button
     private lateinit var btnClear: Button
+    private lateinit var btnMode: Button
+
+    private var separateMode = false
 
     private val picks = ArrayList<Picked>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var converting = false
 
-    private lateinit var webView: WebView
     @Volatile private var doneLatch = CountDownLatch(1)
     @Volatile private var jsError: String? = null
     @Volatile private var pendingB64: String? = null
 
     private var pendingSave: File? = null
     private var pendingName: String? = null
+    private var pendingSaves: List<Pair<File, String>> = emptyList()
 
     private lateinit var adapter: ArrayAdapter<Picked>
 
@@ -82,6 +85,7 @@ class MainActivity : AppCompatActivity() {
         btnConvert = findViewById(R.id.btnConvert)
         btnAdd = findViewById(R.id.btnAdd)
         btnClear = findViewById(R.id.btnClear)
+        btnMode = findViewById(R.id.btnMode)
 
         adapter = object : ArrayAdapter<Picked>(
             this, android.R.layout.simple_list_item_2, android.R.id.text1, picks
@@ -110,8 +114,12 @@ class MainActivity : AppCompatActivity() {
             refreshList()
         }
         btnConvert.setOnClickListener { startConversion() }
+        btnMode.setOnClickListener {
+            separateMode = !separateMode
+            updateModeButton()
+        }
 
-        setupWebView()
+        updateModeButton()
 
         if (Build.VERSION.SDK_INT < 29 && Build.VERSION.SDK_INT >= 23 &&
             checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
@@ -130,9 +138,13 @@ class MainActivity : AppCompatActivity() {
         refreshList()
     }
 
-    private fun setupWebView() {
-        webView = WebView(this)
-        val s = webView.settings
+    private fun updateModeButton() {
+        btnMode.text = if (separateMode) getString(R.string.mode_separate) else getString(R.string.mode_combined)
+    }
+
+    private fun createWorkerWebView(): WebView {
+        val wv = WebView(this)
+        val s = wv.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
         s.blockNetworkLoads = true
@@ -140,8 +152,8 @@ class MainActivity : AppCompatActivity() {
         s.loadWithOverviewMode = false
         s.useWideViewPort = false
         s.textZoom = 100
-        webView.setBackgroundColor(0xFFFFFFFF.toInt())
-        webView.addJavascriptInterface(object {
+        wv.setBackgroundColor(0xFFFFFFFF.toInt())
+        wv.addJavascriptInterface(object {
             @JavascriptInterface
             fun done() {
                 doneLatch.countDown()
@@ -157,10 +169,16 @@ class MainActivity : AppCompatActivity() {
         }, "converterBridge")
         val root = findViewById<FrameLayout>(R.id.root)
         val lp = FrameLayout.LayoutParams(794, ViewGroup.LayoutParams.WRAP_CONTENT)
-        webView.layoutParams = lp
-        webView.translationX = -20000f
-        webView.translationY = -20000f
-        root.addView(webView, lp)
+        wv.layoutParams = lp
+        wv.translationX = -20000f
+        wv.translationY = -20000f
+        root.addView(wv, lp)
+        return wv
+    }
+
+    private fun destroyWorkerWebView(wv: WebView) {
+        (wv.parent as? ViewGroup)?.removeView(wv)
+        wv.destroy()
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -310,6 +328,41 @@ class MainActivity : AppCompatActivity() {
                         .show()
                 }
             }
+        } else if (requestCode == 400 && resultCode == Activity.RESULT_OK && data != null) {
+            val treeUri = data.data
+            val pending = pendingSaves
+            pendingSaves = emptyList()
+            if (treeUri != null) {
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        treeUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                } catch (_: Exception) {
+                }
+                val tree = DocumentFile.fromTreeUri(this, treeUri)
+                var saved = 0
+                if (tree != null) {
+                    for ((file, name) in pending) {
+                        val doc = tree.createFile("application/pdf", name.removeSuffix(".pdf"))
+                        if (doc != null) {
+                            contentResolver.openOutputStream(doc.uri)?.use { os ->
+                                file.inputStream().copyTo(os)
+                            }
+                            saved++
+                        }
+                    }
+                }
+                if (saved > 0 && pending.isNotEmpty()) {
+                    showResult("$saved PDF(s) saved", treeUri, pending.first().first)
+                } else {
+                    AlertDialog.Builder(this)
+                        .setTitle("Save failed")
+                        .setMessage("Could not write the PDF(s) to the chosen folder.")
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+            }
         }
     }
 
@@ -327,17 +380,31 @@ class MainActivity : AppCompatActivity() {
         val snapshot = ArrayList(picks)
         Thread {
             try {
-                val pdfs = ArrayList<File>()
-                snapshot.forEachIndexed { idx, pick ->
-                    val src = copyToCache(pick, idx)
-                    pdfs.add(convertOne(src, pick.ext))
-                }
-                val merged = if (pdfs.size == 1) pdfs[0] else mergePdfs(pdfs)
-                val finalFile = ensureUnder8mb(merged)
-                val outName = outputName(snapshot)
-                mainHandler.post {
-                    progress.dismiss()
-                    launchSaveAs(finalFile, outName)
+                if (separateMode) {
+                    val results = ArrayList<Pair<File, String>>()
+                    snapshot.forEachIndexed { idx, pick ->
+                        val src = copyToCache(pick, idx)
+                        val pdf = convertOne(src, pick.ext)
+                        val finalPdf = ensureUnder8mb(pdf)
+                        results.add(finalPdf to singleName(pick, idx))
+                    }
+                    mainHandler.post {
+                        progress.dismiss()
+                        launchSaveToDirectory(results)
+                    }
+                } else {
+                    val pdfs = ArrayList<File>()
+                    snapshot.forEachIndexed { idx, pick ->
+                        val src = copyToCache(pick, idx)
+                        pdfs.add(convertOne(src, pick.ext))
+                    }
+                    val merged = if (pdfs.size == 1) pdfs[0] else mergePdfs(pdfs)
+                    val finalFile = ensureUnder8mb(merged)
+                    val outName = outputName(snapshot)
+                    mainHandler.post {
+                        progress.dismiss()
+                        launchSaveAs(finalFile, outName)
+                    }
                 }
             } catch (t: Throwable) {
                 val trace = t.stackTrace.take(8).joinToString("\n") { "  at $it" }
@@ -368,6 +435,17 @@ class MainActivity : AppCompatActivity() {
                 refreshList()
             }
         }, 4 * 60 * 1000L)
+    }
+
+    private fun singleName(pick: Picked, idx: Int): String {
+        val base = pick.name
+            .substringBeforeLast('.')
+            .replace(Regex("[^A-Za-z0-9]+"), "_")
+            .trim('_')
+            .take(40)
+            .ifBlank { "document" }
+        val ts = System.currentTimeMillis() % 100000
+        return "${base}_${idx}_$ts.pdf"
     }
 
     private fun outputName(snapshot: List<Picked>): String {
@@ -416,67 +494,73 @@ class MainActivity : AppCompatActivity() {
             throw IOException("$label is too large for on-device rendering (max ~45 MB).")
         }
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-        doneLatch = CountDownLatch(1)
-        jsError = null
-        pendingB64 = b64
-        var started = false
-        val runConvert = Runnable {
-            if (!started) {
-                started = true
-                webView.evaluateJavascript("window.start()", null)
-            }
-        }
-        mainHandler.post {
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.post(runConvert)
+        val wv = createWorkerWebView()
+        try {
+            doneLatch = CountDownLatch(1)
+            jsError = null
+            pendingB64 = b64
+            var started = false
+            val runConvert = Runnable {
+                if (!started) {
+                    started = true
+                    wv.evaluateJavascript("window.start()", null)
                 }
-
-                @Suppress("OVERRIDE_DEPRECATION")
-                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
             }
-            webView.loadDataWithBaseURL(null, workerHtml, "text/html", "utf-8", null)
-        }
-        mainHandler.postDelayed(runConvert, 15_000)
+            mainHandler.post {
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        view?.post(runConvert)
+                    }
 
-        if (!doneLatch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-            throw IOException("Rendering '$label' timed out.")
-        }
-        jsError?.let { throw IOException("$label conversion error: $it") }
+                    @Suppress("OVERRIDE_DEPRECATION")
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                }
+                wv.loadDataWithBaseURL(null, workerHtml, "text/html", "utf-8", null)
+            }
+            mainHandler.postDelayed(runConvert, 15_000)
 
-        Thread.sleep(700)
-        onMain { layoutForPrint() }
-        return printWebViewToPdf(uniquePdf(label))
+            if (!doneLatch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                throw IOException("Rendering '$label' timed out.")
+            }
+            jsError?.let { throw IOException("$label conversion error: $it") }
+
+            Thread.sleep(700)
+            onMain { layoutForPrint(wv) }
+            return printWebViewToPdf(wv, uniquePdf(label))
+        } finally {
+            pendingB64 = null
+            mainHandler.post { destroyWorkerWebView(wv) }
+        }
     }
 
-    private fun layoutForPrint() {
+    private fun layoutForPrint(wv: WebView) {
         val w = 794
-        webView.layoutParams = FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT)
-        webView.requestLayout()
+        wv.layoutParams = FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT)
+        wv.requestLayout()
         val specW = MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY)
         val specH = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED)
-        webView.measure(specW, specH)
-        val h = webView.measuredHeight
-        webView.layout(0, 0, w, h)
+        wv.measure(specW, specH)
+        val h = wv.measuredHeight
+        wv.layout(0, 0, w, h)
     }
 
-    private fun printWebViewToPdf(outFile: File): File {
+    private fun printWebViewToPdf(wv: WebView, outFile: File): File {
         if (outFile.exists()) outFile.delete()
-        val adapter = onMain { webView.createPrintDocumentAdapter("document") }
+        val adapter = onMain { wv.createPrintDocumentAdapter("document") }
         val ok = PdfPrint().print(adapter, outFile)
         return if (ok) outFile else {
             if (outFile.exists()) outFile.delete()
-            onMain { rasterizeWebViewToPdf(outFile) }
+            onMain { rasterizeWebViewToPdf(wv, outFile) }
         }
     }
 
-    private fun rasterizeWebViewToPdf(outFile: File): File {
+    private fun rasterizeWebViewToPdf(wv: WebView, outFile: File): File {
         val pageW = 794
         val pageH = 1123
         val scale = 2.0f
         val bmpW = (pageW * scale).toInt()
         val bmpH = (pageH * scale).toInt()
-        val totalH = max(webView.measuredHeight, pageH)
+        val totalH = max(wv.measuredHeight, pageH)
         val numPages = (totalH + pageH - 1) / pageH
         val pagePts = PDRectangle(595.28f, 841.89f)
         val doc = PDDocument()
@@ -487,7 +571,7 @@ class MainActivity : AppCompatActivity() {
                 canvas.scale(scale, scale)
                 canvas.translate(0f, -(i * pageH).toFloat())
                 canvas.drawColor(android.graphics.Color.WHITE)
-                webView.draw(canvas)
+                wv.draw(canvas)
                 val bos = java.io.ByteArrayOutputStream()
                 bmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
                 bmp.recycle()
@@ -819,6 +903,12 @@ class MainActivity : AppCompatActivity() {
             putExtra(Intent.EXTRA_TITLE, name)
         }
         startActivityForResult(i, 300)
+    }
+
+    private fun launchSaveToDirectory(files: List<Pair<File, String>>) {
+        pendingSaves = files
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        startActivityForResult(i, 400)
     }
 
     private fun showResult(name: String, uri: Uri?, file: File) {
