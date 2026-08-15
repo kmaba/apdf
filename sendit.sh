@@ -1,45 +1,54 @@
 #!/usr/bin/env bash
-# Build the release APK and publish it as a GitHub release for beta testing.
+# Build the release APK and upload it to a file host so it can be shared for
+# beta testing. Prints the direct download link.
 #
 # Usage:
-#   ./sendit.sh           # use versionName from app/build.gradle.kts
-#   ./sendit.sh 1.3.0     # explicit version
+#   ./sendit.sh [version] [apk-file]
 #
-# Requires ./gradlew, git and an authenticated `gh` CLI.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="${1:-$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)}"
-if [[ -z "${VERSION}" ]]; then
-  echo "error: could not determine version from app/build.gradle.kts" >&2
-  exit 1
+APK="${2:-app/build/outputs/apk/release/app-release.apk}"
+
+# Build unless the caller passed an existing APK path.
+if [[ "${2:-}" == "" ]]; then
+  echo ">> building release APK"
+  ./gradlew :app:assembleRelease
 fi
 
-TAG="v${VERSION}"
-APK="app/build/outputs/apk/release/app-release.apk"
-DIST="${DIST:-PDF-Converter.apk}"
+[[ -f "${APK}" ]] || { echo "error: APK not found: ${APK}" >&2; exit 1; }
 
-echo ">> building release APK (${VERSION})"
-./gradlew :app:assembleRelease
+NAME="PDF-Converter.apk"
 
-echo ">> packaging ${DIST}"
-cp -f "${APK}" "${DIST}"
+upload_catbox() {
+  curl -sS -m 120 -F 'reqtype=fileupload' -F "fileToUpload=@${APK};filename=${NAME}" \
+    https://catbox.moe/user/api.php
+}
 
-echo ">> pushing commits"
-git push origin HEAD
+upload_tmpfiles() {
+  curl -sS -m 120 -F "file=@${APK};filename=${NAME}" \
+    https://tmpfiles.org/api/v1/upload
+}
 
-echo ">> tagging ${TAG}"
-git tag -f "${TAG}"
+echo ">> uploading ${NAME} ($(du -h "${APK}" | cut -f1))"
 
-echo ">> pushing ${TAG}"
-git push origin "${TAG}"
+URL="$(upload_catbox || true)"
+if [[ "${URL}" == https://files.catbox.moe/* ]]; then
+  echo ">> direct link: ${URL}"
+  exit 0
+fi
 
-echo ">> publishing GitHub release"
-REPO="$(git remote get-url origin | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')"
-gh release create "${TAG}" "${DIST}" \
-  --title "apdf ${VERSION}" \
-  --notes "apdf ${VERSION} beta build for testing." \
-  --repo "${REPO}"
+echo ">> catbox failed, trying tmpfiles.org…"
+RESP="$(upload_tmpfiles || true)"
+URL="$(printf '%s' "${RESP}" | grep -oP '"url":"\K[^"]+' || true)"
+if [[ -n "${URL}" ]]; then
+  # tmpfiles URLs need /dl/ for a direct download.
+  URL="${URL//tmpfiles.org\//tmpfiles.org/dl/}"
+  echo ">> direct link: ${URL}"
+  echo ">> (tmpfiles links expire after ~60 minutes)"
+  exit 0
+fi
 
-echo ">> done: https://github.com/${REPO}/releases/tag/${TAG}"
+echo ">> upload failed (catbox response: ${URL:-none}, tmpfiles: ${RESP:-none})" >&2
+exit 1
