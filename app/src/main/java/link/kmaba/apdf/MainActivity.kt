@@ -155,7 +155,17 @@ class MainActivity : AppCompatActivity() {
         if (!converting) {
             val wv = webView
             webView = null
-            wv?.destroy()
+            wv?.let {
+                try {
+                    (it.parent as? ViewGroup)?.removeView(it)
+                } catch (_: Throwable) {
+                }
+                try {
+                    it.removeAllViews()
+                    it.destroy()
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
@@ -532,7 +542,10 @@ class MainActivity : AppCompatActivity() {
         onMain {
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript("window.start()", null)
+                    try {
+                        view?.evaluateJavascript("window.start()", null)
+                    } catch (_: Throwable) {
+                    }
                 }
             }
             wv.loadDataWithBaseURL(null, workerHtml, "text/html", "utf-8", null)
