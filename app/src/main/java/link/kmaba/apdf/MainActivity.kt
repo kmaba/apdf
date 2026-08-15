@@ -7,13 +7,13 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Matrix
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.print.PdfPrint
 import android.provider.MediaStore
 import android.util.Base64
 import android.view.View
@@ -44,6 +44,7 @@ import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
+import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
@@ -470,13 +471,13 @@ class MainActivity : AppCompatActivity() {
     private fun convertOne(file: File, ext: String): File {
         return when (ext) {
             "pdf" -> file
-            "docx" -> runJsConversion(docxWorkerHtml(), file, "docx", 60_000)
+            "docx" -> runJsConversion(docxWorkerHtml(), file, "docx", 60_000, 794, 1123)
             "doc" -> throw IOException("'$ext' is the old Word format. Re-save the document as .docx and try again.")
-            "pptx" -> runJsConversion(pptxWorkerHtml(), file, "pptx", 90_000)
+            "pptx" -> runJsConversion(pptxWorkerHtml(), file, "pptx", 90_000, 1123, 794)
             "ppt" -> throw IOException("'$ext' is the old PowerPoint format. Re-save the presentation as .pptx and try again.")
             "png", "jpg", "jpeg", "webp", "bmp", "gif" -> imageToPdf(file, ext)
-            "txt", "md", "markdown" -> runJsConversion(textWorkerHtml(file, ext), file, "text", 30_000)
-            "html", "htm" -> runJsConversion(htmlWorkerHtml(file), file, "html", 30_000)
+            "txt", "md", "markdown" -> runJsConversion(textWorkerHtml(file, ext), file, "text", 30_000, 794, 1123)
+            "html", "htm" -> runJsConversion(htmlWorkerHtml(file), file, "html", 30_000, 794, 1123)
             else -> throw IOException("Unsupported file type '.$ext'.")
         }
     }
@@ -494,6 +495,9 @@ class MainActivity : AppCompatActivity() {
         s.useWideViewPort = false
         s.textZoom = 100
         wv.setBackgroundColor(0xFFFFFFFF.toInt())
+        // Software rendering lets us capture the content with draw(Canvas)
+        // (hardware-accelerated WebViews can't be rasterized to a Bitmap).
+        wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
         wv.addJavascriptInterface(object {
             @JavascriptInterface
             fun done() {
@@ -529,7 +533,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun runJsConversion(workerHtml: String, file: File, label: String, timeoutMs: Long): File {
+    private fun runJsConversion(workerHtml: String, file: File, label: String, timeoutMs: Long, pageW: Int, pageH: Int): File {
         val bytes = file.readBytes()
         if (bytes.size > 45 * 1024 * 1024) {
             throw IOException("$label is too large for on-device rendering (max ~45 MB).")
@@ -557,8 +561,7 @@ class MainActivity : AppCompatActivity() {
         jsError?.let { throw IOException("$label conversion error: $it") }
 
         Thread.sleep(700)
-        onMain { layoutForPrint(wv) }
-        val out = printWebViewToPdf(wv, uniquePdf(label))
+        val out = printWebViewToPdf(wv, uniquePdf(label), pageW, pageH)
         // Reset for the next conversion; the WebView itself is reused, never destroyed.
         pendingB64 = null
         try {
@@ -568,24 +571,62 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 
-    private fun layoutForPrint(wv: WebView) {
-        val w = 794
-        wv.layoutParams = FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT)
-        wv.requestLayout()
-        val specW = MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY)
-        val specH = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED)
-        wv.measure(specW, specH)
-        val h = wv.measuredHeight
-        wv.layout(0, 0, w, h)
+    private fun printWebViewToPdf(wv: WebView, outFile: File, pageW: Int, pageH: Int): File {
+        if (outFile.exists()) outFile.delete()
+        // WebView.createPrintDocumentAdapter() can't be driven manually on
+        // Android 16: its onLayout/onWrite SIGTRAP on a background thread and
+        // deadlock on the UI thread. Instead, rasterize the WebView content
+        // page-by-page and build the PDF with PDFBox.
+        return renderWebViewToPdf(wv, outFile, pageW, pageH)
     }
 
-    private fun printWebViewToPdf(wv: WebView, outFile: File): File {
-        if (outFile.exists()) outFile.delete()
-        val adapter = onMain { wv.createPrintDocumentAdapter("document") }
-        val ok = PdfPrint().print(adapter, outFile)
-        if (ok) return outFile
-        if (outFile.exists()) outFile.delete()
-        throw IOException("Could not render the document to PDF.")
+    private fun renderWebViewToPdf(wv: WebView, outFile: File, pageW: Int, pageH: Int): File {
+        // The WebView is kept off-screen normally. During capture we briefly
+        // move it into view so the compositor actually rasterizes each page as
+        // we scroll, then restore it off-screen afterwards.
+        val totalH = onMain {
+            wv.layoutParams = FrameLayout.LayoutParams(pageW, pageH)
+            wv.translationX = 0f
+            wv.translationY = 0f
+            wv.requestLayout()
+            wv.measure(MeasureSpec.makeMeasureSpec(pageW, MeasureSpec.EXACTLY),
+                       MeasureSpec.makeMeasureSpec(pageH, MeasureSpec.EXACTLY))
+            wv.layout(0, 0, pageW, pageH)
+            wv.contentHeight
+        }
+        android.util.Log.d("apdf", "render: pageW=$pageW pageH=$pageH totalH=$totalH")
+        if (totalH <= 0) throw IOException("Could not measure the document.")
+
+        val doc = PDDocument()
+        try {
+            var pageIndex = 0
+            while (pageIndex * pageH < totalH) {
+                val h = min(pageH, totalH - pageIndex * pageH)
+                onMain { wv.scrollTo(0, pageIndex * pageH) }
+                Thread.sleep(300)
+                val bm = Bitmap.createBitmap(pageW, h, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bm)
+                onMain { wv.draw(canvas) }
+                val bos = java.io.ByteArrayOutputStream()
+                bm.compress(Bitmap.CompressFormat.JPEG, 100, bos)
+                bm.recycle()
+                val img = PDImageXObject.createFromByteArray(doc, bos.toByteArray(), "p$pageIndex.jpg")
+                val page = PDPage(PDRectangle(pageW.toFloat(), h.toFloat()))
+                doc.addPage(page)
+                val cs = PDPageContentStream(doc, page)
+                cs.drawImage(img, 0f, 0f, pageW.toFloat(), h.toFloat())
+                cs.close()
+                pageIndex++
+            }
+            doc.save(outFile)
+            return outFile
+        } finally {
+            doc.close()
+            onMain {
+                wv.translationX = -20000f
+                wv.translationY = -20000f
+            }
+        }
     }
 
     private fun <T> onMain(block: () -> T): T {
@@ -611,22 +652,21 @@ class MainActivity : AppCompatActivity() {
     private fun readAsset(name: String): String =
         assets.open(name).bufferedReader().use { it.readText() }
 
-    private val mammothJs by lazy { readAsset("js/mammoth.min.js") }
     private val jqueryJs by lazy { readAsset("js/jquery.min.js") }
     private val jszipJs by lazy { readAsset("js/jszip.min.js") }
     private val d3Js by lazy { readAsset("js/d3.min.js") }
     private val dimpleJs by lazy { readAsset("js/dimple.min.js") }
     private val pptxJs by lazy { readAsset("js/pptx2html.min.js") }
+    private val docxPreviewJs by lazy { readAsset("js/docx-preview.min.js") }
 
     private val DOCX_TEMPLATE = """
         <!DOCTYPE html><html><head><meta charset="utf-8">
         <style>
-        @page { size: A4; margin: 12mm; }
-        html, body { margin: 0; padding: 0; }
-        body { font-family: Calibri, 'Segoe UI', Arial, sans-serif; font-size: 12pt; color: #000; }
-        img { max-width: 100%; }
-        table { border-collapse: collapse; }
+        html, body { margin: 0; padding: 0; background: #fff; }
+        body { overflow-wrap: break-word; word-wrap: break-word; }
+        #content img { max-width: 100%; }
         </style></head><body>
+        <div id="content"></div>
         <script>
         window.done = false;
         window.finish = function (err) {
@@ -638,20 +678,21 @@ class MainActivity : AppCompatActivity() {
         window.convert = function () {
           try {
             var b64 = converterBridge.getB64();
-            mammoth.convertToHtml({ arrayBuffer: b64ToBytes(b64).buffer }).then(function (r) {
-              document.body.innerHTML = r.value;
+            var container = document.getElementById('content');
+            docx.renderAsync(b64ToBytes(b64).buffer, container, null).then(function () {
               window.finish(null);
             }, function (err) { window.finish(err); });
           } catch (e) { window.finish(e); }
         };
         window.start = function () {
           function attempt() {
-            if (window.mammoth) { window.convert(); } else { setTimeout(attempt, 150); }
+            if (window.docx && window.JSZip) { window.convert(); } else { setTimeout(attempt, 150); }
           }
           attempt();
         };
         </script>
-        <script>__MAMMOTH__</script>
+        <script>__JSZIP__</script>
+        <script>__DOCXPREVIEW__</script>
         </body></html>
     """.trimIndent()
 
@@ -660,7 +701,7 @@ class MainActivity : AppCompatActivity() {
         <style>
         @page { size: A4; margin: 0; }
         html, body { margin: 0; padding: 0; background: #fff; }
-        #host { width: 794px; }
+        #host { width: 1123px; }
         </style></head><body>
         <div id="host"></div>
         <script>
@@ -688,7 +729,7 @@ class MainActivity : AppCompatActivity() {
           attempt();
         };
         window.fitSlides = function () {
-          var PW = 794, PH = 1123;
+          var PW = 1123, PH = 794;
           var host = document.getElementById('host');
           var wrapper = host.querySelector('.pptx-wrapper');
           if (wrapper) wrapper.style.transform = 'none';
@@ -714,7 +755,9 @@ class MainActivity : AppCompatActivity() {
         </body></html>
     """.trimIndent()
 
-    private fun docxWorkerHtml(): String = DOCX_TEMPLATE.replace("__MAMMOTH__", mammothJs)
+    private fun docxWorkerHtml(): String = DOCX_TEMPLATE
+        .replace("__JSZIP__", jszipJs)
+        .replace("__DOCXPREVIEW__", docxPreviewJs)
 
     private fun pptxWorkerHtml(): String = PPTX_TEMPLATE
         .replace("__JQUERY__", jqueryJs)
@@ -727,10 +770,14 @@ class MainActivity : AppCompatActivity() {
         val raw = file.readText(Charsets.UTF_8)
         val bodyHtml = raw
             .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .let { "<pre style=\"white-space:pre-wrap;font-family:Consolas,monospace;font-size:11pt\">$it</pre>" }
+            .let { "<pre style=\"white-space:pre-wrap;font-family:Consolas,monospace;font-size:11pt;margin:0\">$it</pre>" }
         return """
             <!DOCTYPE html><html><head><meta charset="utf-8">
-            <style>@page { size: A4; margin: 14mm; } html,body{margin:0;padding:0}</style>
+            <style>
+            html,body{margin:0;padding:0;background:#fff}
+            body{font-family:Consolas,monospace;font-size:11pt;color:#000;padding:14mm;overflow-wrap:break-word;word-wrap:break-word}
+            *{max-width:100%}
+            </style>
             </head><body>$bodyHtml
             <script>window.start = function () { try { converterBridge.done(); } catch (e) {} };</script>
             </body></html>
@@ -741,7 +788,14 @@ class MainActivity : AppCompatActivity() {
         val raw = file.readText(Charsets.UTF_8)
         return """
             <!DOCTYPE html><html><head><meta charset="utf-8">
-            <style>@page { size: A4; margin: 14mm; }</style>
+            <style>
+            html,body{margin:0;padding:0;background:#fff}
+            body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:12pt;color:#000;line-height:1.3;padding:14mm;overflow-wrap:break-word;word-wrap:break-word}
+            img{max-width:100%;height:auto}
+            table{max-width:100%;table-layout:fixed;border-collapse:collapse}
+            th,td{border:1px solid #999;padding:4px 7px}
+            *{max-width:100%}
+            </style>
             </head><body>$raw
             <script>window.start = function () { try { converterBridge.done(); } catch (e) {} };</script>
             </body></html>
@@ -844,14 +898,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun showResult(name: String, uri: Uri?, file: File) {
         AlertDialog.Builder(this)
-            .setTitle("Done")
+            .setTitle("Conversion complete")
             .setMessage("Saved $name")
-            .setItems(arrayOf("Share", "Open", "OK")) { _, which ->
-                when (which) {
-                    0 -> shareFile(uri, file)
-                    1 -> openFile(uri, file)
-                }
-            }
+            .setPositiveButton("Open") { _, _ -> openFile(uri, file) }
+            .setNegativeButton("Share") { _, _ -> shareFile(uri, file) }
+            .setNeutralButton("Done", null)
             .setCancelable(true)
             .show()
     }
